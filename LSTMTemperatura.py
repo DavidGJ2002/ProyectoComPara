@@ -1,147 +1,178 @@
-import itertools
-import multiprocessing  # Cambié 'multiprocess' a 'multiprocessing' para usar la biblioteca estándar
-import time
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.model_selection import train_test_split
+import time
+import multiprocessing
 from sklearn.metrics import mean_squared_error
+from math import sqrt
 
-# Método para hacer nivelación de cargas
+# Función de nivelación de cargas
 def nivelacionCargas(D, n_p):
-    s = len(D)%n_p
-    n_D = D[:s]
-    t = int((len(D)-s)/n_p)
-    out=[]
-    temp=[]
+    s = len(D) % n_p
+    n_D = D[:s]  # Elementos sobrantes
+    t = int((len(D) - s) / n_p)  # Número de elementos por grupo
+    out = [[] for _ in range(n_p)]  # Inicializar listas vacías para cada lote
+
+    # Distribuir los elementos restantes entre los lotes
+    index = 0
     for i in D[s:]:
-        temp.append(i)
-        if len(temp)==t:
-            out.append(temp)
-            temp = []
+        out[index].append(i)
+        index = (index + 1) % n_p  # Distribuir de forma balanceada entre los lotes
+
+    # Asignar los elementos sobrantes (n_D) a los primeros lotes
     for i in range(len(n_D)):
         out[i].append(n_D[i])
+
     return out
 
+# Clase LSTM simplificada
+class LSTM:
+    def __init__(self, input_size, hidden_size, output_size):
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
 
-# Definir modelo LSTM
-class ModeloLSTM(nn.Module):
-    def __init__(self, tamEntrada, tamOculto, tamSalida, numCapas=1):
-        super(ModeloLSTM, self).__init__()
-        self.lstm = nn.LSTM(tamEntrada, tamOculto, numCapas, batch_first=True)
-        self.fc = nn.Linear(tamOculto, tamSalida)
+        # Pesos para las puertas y salidas
+        self.Wf = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.bf = np.zeros((hidden_size, 1))
+        self.Wi = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.bi = np.zeros((hidden_size, 1))
+        self.Wo = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.bo = np.zeros((hidden_size, 1))
+        self.Wc = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.bc = np.zeros((hidden_size, 1))
+        self.Wy = np.random.randn(output_size, hidden_size) * 0.01
+        self.by = np.zeros((output_size, 1))
 
-    def forward(self, x):
-        salida, _ = self.lstm(x)
-        salida = self.fc(salida[:, -1, :])
-        return salida
+    def step(self, x, h_prev, c_prev):
+        combined = np.vstack((h_prev, x))
+        ft = self.sigmoid(np.dot(self.Wf, combined) + self.bf)
+        it = self.sigmoid(np.dot(self.Wi, combined) + self.bi)
+        c_tilde = np.tanh(np.dot(self.Wc, combined) + self.bc)
+        c_next = ft * c_prev + it * c_tilde
+        ot = self.sigmoid(np.dot(self.Wo, combined) + self.bo)
+        h_next = ot * np.tanh(c_next)
+        y = np.dot(self.Wy, h_next) + self.by
+        return y, h_next, c_next
 
-# Cargar y preparar los datos
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-x))
+
+# Función de entrenamiento y evaluación
+def entrenarYEvaluarLSTM(hidden_size, X_train, y_train, X_test, y_test, sequence_length, epochs=10, lr=0.001):
+    lstm = LSTM(input_size=1, hidden_size=hidden_size, output_size=1)
+    h_prev = np.zeros((hidden_size, 1))
+    c_prev = np.zeros((hidden_size, 1))
+
+    # Entrenamiento
+    for epoch in range(epochs):
+        for i in range(len(X_train)):
+            x_seq = X_train[i].reshape(-1, 1)
+            y_true = y_train[i].reshape(-1, 1)
+
+            # Forward pass
+            for t in range(x_seq.shape[0]):
+                y_pred, h_prev, c_prev = lstm.step(x_seq[t], h_prev, c_prev)
+
+            # Backprop simplificada (actualización manual de pesos)
+            lstm.Wy -= lr * (y_pred - y_true).T @ h_prev.T
+
+    # Validación
+    predictions = []
+    for i in range(len(X_test)):
+        x_seq = X_test[i].reshape(-1, 1)
+        for t in range(x_seq.shape[0]):
+            y_pred, h_prev, c_prev = lstm.step(x_seq[t], h_prev, c_prev)
+        predictions.append(y_pred.item())
+
+    rmse = sqrt(mean_squared_error(y_test, predictions))
+    return {'hidden_size': hidden_size, 'rmse': rmse, 'predictions': predictions}
+
+# Función para crear secuencias para series temporales
+def create_sequences(data, sequence_length):
+    sequences, targets = [], []
+    for i in range(len(data) - sequence_length):
+        sequences.append(data[i:i + sequence_length])
+        targets.append(data[i + sequence_length])
+    return np.array(sequences), np.array(targets)
+
+# Entrenamiento en lotes
+def entrenar_en_lote(lote, X_train, y_train, X_test, y_test, sequence_length):
+    resultados = []
+    for hidden_size in lote:
+        resultado = entrenarYEvaluarLSTM(hidden_size, X_train, y_train, X_test, y_test, sequence_length)
+        resultados.append(resultado)
+    return resultados
+
+# Dividir datos en entrenamiento y prueba (debes adaptarlo según tu conjunto de datos)
 data = pd.read_csv(r"C:\Users\david\Downloads\data.csv", low_memory=False)
+columnasI = ['TMAX', 'TMIN', 'TAVG', 'PRCP']  # Selección de columnas relevantes
+data = data[columnasI].dropna()
 
-# Selección de las columnas relevantes
-columnasI = ['LATITUDE', 'LONGITUDE', 'TMAX', 'TMIN', 'TAVG', 'PRCP']  # Utiliza columnas normalizadas
-data = data[columnasI]
-
-# Normalizar datos
+# Normalizar las columnas
 def normalize_column(column):
     min_val = column.min()
     max_val = column.max()
     return (column - min_val) / (max_val - min_val)
 
-data = data.dropna() # Eliminar filas con NaN
-
-for column in ['TMAX', 'TMIN', 'TAVG', 'PRCP']:
+for column in columnasI:
     data[column] = normalize_column(data[column])
 
-# Convertir las columnas seleccionadas a tensores
-X = data[['LATITUDE', 'LONGITUDE', 'TMAX', 'TMIN', 'TAVG', 'PRCP']].values  # Características
-y_max = data['TMAX'].values  # Etiqueta de temperatura máxima
-y_min = data['TMIN'].values  # Etiqueta de temperatura mínima
+# División de datos
+train_size = int(len(data) * 0.8)
+train, test = data[:train_size], data[train_size:]
 
-X = X.reshape(X.shape[0], 1, X.shape[1])
+sequence_length = 50  # Tamaño de la secuencia
+X_train_tmax, y_train_tmax = create_sequences(train['TMAX'].values, sequence_length)
+X_test_tmax, y_test_tmax = create_sequences(test['TMAX'].values, sequence_length)
 
-XEntrenamiento, XValidacion, yEntrenamientoMax, yValidacionMax = train_test_split(X, y_max, test_size=0.2)
-XEntrenamiento, XValidacion, yEntrenamientoMin, yValidacionMin = train_test_split(X, y_min, test_size=0.2)
+X_train_tmin, y_train_tmin = create_sequences(train['TMIN'].values, sequence_length)
+X_test_tmin, y_test_tmin = create_sequences(test['TMIN'].values, sequence_length)
 
-# Convertir a tensores de PyTorch
-XEntrenamiento = torch.tensor(XEntrenamiento, dtype=torch.float32)
-yEntrenamientoMax = torch.tensor(yEntrenamientoMax, dtype=torch.float32).view(-1, 1)
-yEntrenamientoMin = torch.tensor(yEntrenamientoMin, dtype=torch.float32).view(-1, 1)
-XValidacion = torch.tensor(XValidacion, dtype=torch.float32)
-yValidacionMax = torch.tensor(yValidacionMax, dtype=torch.float32).view(-1, 1)
-yValidacionMin = torch.tensor(yValidacionMin, dtype=torch.float32).view(-1, 1)
-
-# Definir combinaciones de hiperparámetros
-parametrosLSTM = {
-    'tamOculto': [32, 64, 128],
-    'tasaAprendizaje': [1e-2, 1e-3,1e-4],
-    'numCapas': [1, 2, 3]
-}
-combinacionesParametros = list(itertools.product(parametrosLSTM['tamOculto'], parametrosLSTM['tasaAprendizaje'], parametrosLSTM['numCapas']))
-
-# Función para entrenar y evaluar el modelo
-def entrenarYEvaluar(parametros):
-    tamOculto, tasaAprendizaje, numCapas = parametros
-    modelo = ModeloLSTM(tamEntrada=6, tamOculto=tamOculto, tamSalida=1, numCapas=numCapas)
-    criterio = nn.MSELoss()
-    optimizador = optim.Adam(modelo.parameters(), lr=tasaAprendizaje)
-
-    # Entrenamiento para la temperatura máxima
-    for epoca in range(100): 
-        modelo.train()
-        salidasMax = modelo(XEntrenamiento)
-        perdidaMax = criterio(salidasMax, yEntrenamientoMax)
-
-        optimizador.zero_grad()
-        perdidaMax.backward()
-        optimizador.step()
-
-    # Evaluación para la temperatura máxima
-    modelo.eval()
-    with torch.no_grad():
-        salidasMaxValidacion = modelo(XValidacion)
-        perdidaMaxValidacion = mean_squared_error(yValidacionMax.numpy(), salidasMaxValidacion.numpy())
-
-    # Entrenamiento para la temperatura mínima
-    for epoca in range(100):
-        modelo.train()
-        salidasMin = modelo(XEntrenamiento)
-        perdidaMin = criterio(salidasMin, yEntrenamientoMin)
-
-        optimizador.zero_grad()
-        perdidaMin.backward()
-        optimizador.step()
-
-    # Evaluación para la temperatura mínima
-    with torch.no_grad():
-        salidasMinValidacion = modelo(XValidacion)
-        perdidaMinValidacion = mean_squared_error(yValidacionMin.numpy(), salidasMinValidacion.numpy())
-
-    return {'parametros': parametros, 'perdidaMaxValidacion': perdidaMaxValidacion, 'perdidaMinValidacion': perdidaMinValidacion}
-
-# Función para ejecutar el entrenamiento en lotes
-def entrenar_en_lote(lote):
-    return [entrenarYEvaluar(param) for param in lote]
-
-# Ejecutar en paralelo con nivelación de cargas
+# Configuración y paralelismo
 if __name__ == '__main__':
+    hidden_sizes = [5,10,20]
     cores = multiprocessing.cpu_count()
-    print(cores)
-    tiempoInicio = time.time()
-    lotesParametros = nivelacionCargas(combinacionesParametros, 7)
+    print(f"Usando {cores} núcleos para paralelismo.")
 
+    start_time = time.time()
+
+    lotesParametros = nivelacionCargas(hidden_sizes, cores)
+
+    # Medir el tiempo antes de la paralelización
+    parallel_start_time = time.time()
+
+    # Entrenamiento paralelo para TMAX
     with multiprocessing.Pool(processes=cores) as pool:
-        resultados = pool.map(entrenar_en_lote, lotesParametros)
+        resultadosTMAX = pool.starmap(
+            entrenar_en_lote,
+            [(lote, X_train_tmax, y_train_tmax, X_test_tmax, y_test_tmax, sequence_length) for lote in lotesParametros]
+        )
 
-    # Aplanar la lista de resultados
-    resultados = [item for sublista in resultados for item in sublista]
+    # Aplanar los resultados de TMAX
+    resultadosTMAX = [resultado for sublista in resultadosTMAX for resultado in sublista]
 
-    tiempoFin = time.time()
+    # Medir el tiempo después de la paralelización para TMAX
+    parallel_end_time = time.time()
 
-    # Recolectar y mostrar los mejores resultados
-    mejoresParametros = min(resultados, key=lambda x: x['perdidaMaxValidacion'] + x['perdidaMinValidacion'])
-    print(f"Mejores hiperparámetros encontrados: {mejoresParametros}")
-    print(f"Tiempo total de optimización: {tiempoFin - tiempoInicio:.2f} segundos")
+    # Buscar el mejor modelo para TMAX
+    mejorModeloTMAX = min(resultadosTMAX, key=lambda x: x['rmse'])
+    print(f"Mejor modelo LSTM para TMAX: {mejorModeloTMAX}")
+
+    # Entrenamiento paralelo para TMIN
+    with multiprocessing.Pool(processes=cores) as pool:
+        resultadosTMIN = pool.starmap(
+            entrenar_en_lote,
+            [(lote, X_train_tmin, y_train_tmin, X_test_tmin, y_test_tmin, sequence_length) for lote in lotesParametros]
+        )
+
+    # Aplanar los resultados de TMIN
+    resultadosTMIN = [resultado for sublista in resultadosTMIN for resultado in sublista]
+
+    # Buscar el mejor modelo para TMIN
+    mejorModeloTMIN = min(resultadosTMIN, key=lambda x: x['rmse'])
+    print(f"Mejor modelo LSTM para TMIN: {mejorModeloTMIN}")
+
+    end_time = time.time()
+
+    # Imprimir el tiempo total
+    print(f"Tiempo total: {end_time - start_time:.2f} segundos")
